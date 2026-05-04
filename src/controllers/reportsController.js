@@ -5,19 +5,19 @@ const path = require('path')
 const fs = require('fs')
 const {
   Document, Packer, Paragraph, TextRun, ImageRun,
-  HeadingLevel, AlignmentType, PageBreak, TableOfContents,
-  StyleLevel
+  AlignmentType, PageBreak, HeadingLevel
 } = require('docx')
 
 /*
   Helper: download image from URL and return as buffer.
-  Returns null if download fails.
+  Returns null if download fails for any reason.
 */
 const downloadImage = async (url) => {
   try {
+    if (!url || typeof url !== 'string') return null
     const response = await axios.get(url, {
       responseType: 'arraybuffer',
-      timeout: 10000,
+      timeout: 8000,
       headers: { 'User-Agent': 'Mozilla/5.0' }
     })
     return Buffer.from(response.data)
@@ -27,288 +27,334 @@ const downloadImage = async (url) => {
 }
 
 /*
-  Helper: get image dimensions safely.
-  Returns default dimensions if image is invalid.
+  Helper: get safe image dimensions that fit in the document.
 */
 const getImageDimensions = (buffer) => {
   try {
-    // Check PNG signature
     if (buffer[0] === 0x89 && buffer[1] === 0x50) {
       const width = buffer.readUInt32BE(16)
       const height = buffer.readUInt32BE(20)
       if (width > 0 && height > 0) {
-        const maxWidth = 600
+        const maxWidth = 580
         const ratio = Math.min(maxWidth / width, 1)
         return { width: Math.round(width * ratio), height: Math.round(height * ratio) }
       }
     }
-    return { width: 600, height: 400 }
+    return { width: 580, height: 350 }
   } catch {
-    return { width: 600, height: 400 }
+    return { width: 580, height: 350 }
   }
 }
 
 /*
-  generateReport: main function that:
-  1. Reads the uploaded Excel file
+  Helper: convert hex color to docx format (no #)
+*/
+const toDocxColor = (color) => {
+  if (!color) return '0f172a'
+  return color.replace('#', '')
+}
+
+/*
+  Helper: build text runs with keyword highlighting
+*/
+const buildTextRuns = (text, keywordList, baseStyle) => {
+  if (!text) return []
+  if (keywordList.length === 0) {
+    return [new TextRun({ text, ...baseStyle })]
+  }
+
+  const escapedKeywords = keywordList.map(k =>
+    k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  )
+  const regex = new RegExp(`(${escapedKeywords.join('|')})`, 'gi')
+  const parts = text.split(regex)
+
+  return parts.map(part => {
+    const isKeyword = keywordList.includes(part.toLowerCase())
+    return new TextRun({
+      text: part,
+      ...baseStyle,
+      highlight: isKeyword ? 'yellow' : undefined,
+      bold: isKeyword ? true : baseStyle.bold,
+    })
+  })
+}
+
+/*
+  generateReport: main function
+  1. Reads Excel file
   2. Filters articles by keywords
   3. Downloads images
-  4. Generates a Word document using template settings
-  5. Saves the file and returns it
+  4. Applies template settings
+  5. Generates Word document
+  6. Returns .docx file
 */
 const generateReport = async (req, res) => {
   try {
     const {
-      templateId,
-      title,
-      subtitle,
-      keywords,
-      format,
-      reportShape,
-      reportDate
+      templateId, title, subtitle,
+      keywords, format, reportShape, reportDate
     } = req.body
 
-    // Check if file was uploaded
-    if (!req.file) {
-      return res.status(400).json({ message: 'Excel file is required' })
-    }
+    if (!title) return res.status(400).json({ message: 'Report title is required' })
 
-    // Read Excel file
-    const workbook = XLSX.readFile(req.file.path)
-    const sheetName = workbook.SheetNames[0]
-    const sheet = workbook.Sheets[sheetName]
-    const rows = XLSX.utils.sheet_to_json(sheet)
-
-    // Filter rows by keywords if provided
-    let articles = rows.filter(row => row.ExtractionStatus === 'Extraction réussie')
-
-    if (keywords && keywords.trim()) {
-      const keywordList = keywords.split(',').map(k => k.trim().toLowerCase())
-      articles = articles.filter(row => {
-        const text = `${row.Title} ${row.ArticleText}`.toLowerCase()
-        return keywordList.some(kw => text.includes(kw))
-      })
-    }
-
-    if (articles.length === 0) {
-      return res.status(400).json({ message: 'No articles found matching your keywords' })
-    }
-
-    // Fetch template settings from database
+    // ── Fetch template settings ──────────────────────────────
     let templateSettings = {}
     if (templateId) {
-      const templateResult = await pool.query('SELECT settings FROM templates WHERE id = $1', [templateId])
-      if (templateResult.rows.length > 0) {
-        templateSettings = templateResult.rows[0].settings || {}
+      const result = await pool.query(
+        'SELECT settings FROM templates WHERE id = $1', [templateId]
+      )
+      if (result.rows.length > 0 && result.rows[0].settings) {
+        templateSettings = result.rows[0].settings
       }
     }
 
-    const coverPage = templateSettings.coverPage || {}
-    const headerSettings = templateSettings.header || {}
-    const footerSettings = templateSettings.footer || {}
-    const articlePage = templateSettings.articlePage || {}
+    const cover = templateSettings.coverPage || {}
+    const article = templateSettings.articlePage || {}
+    const headerS = templateSettings.header || {}
+    const footerS = templateSettings.footer || {}
 
-    // Build document sections
-    const children = []
+    // ── Read Excel file ──────────────────────────────────────
+    let articles = []
 
-    // ── COVER PAGE ──────────────────────────────────────
-    children.push(
-      new Paragraph({
-        text: title || 'Annual Report',
-        heading: HeadingLevel.TITLE,
-        alignment: AlignmentType.CENTER,
-        spacing: { before: 3000, after: 400 },
-        run: {
-          size: Math.min((coverPage.titleSize || 48) * 2, 96),
-          bold: coverPage.bold || false,
-          color: (coverPage.titleColor || '#0f172a').replace('#', ''),
-          font: coverPage.fontFamily || 'Arial',
-        }
-      })
-    )
+    if (req.file) {
+      const workbook = XLSX.readFile(req.file.path)
+      const sheetName = workbook.SheetNames[0]
+      const sheet = workbook.Sheets[sheetName]
+      const rows = XLSX.utils.sheet_to_json(sheet)
 
-    if (subtitle) {
-      children.push(
-        new Paragraph({
-          alignment: AlignmentType.CENTER,
-          spacing: { after: 400 },
-          children: [
-            new TextRun({
-              text: subtitle,
-              italics: true,
-              size: (coverPage.subtitleSize || 24) * 2,
-              color: (coverPage.subtitleColor || '#475569').replace('#', ''),
-              font: coverPage.fontFamily || 'Arial',
-            })
-          ]
-        })
+      // Filter successful extractions only
+      articles = rows.filter(row =>
+        row.ExtractionStatus === 'Extraction réussie' ||
+        row.ExtractionStatus === 'Success' ||
+        !row.ExtractionStatus
       )
+
+      // Filter by keywords if provided
+      if (keywords && keywords.trim()) {
+        const keywordList = keywords.split(',').map(k => k.trim().toLowerCase()).filter(k => k)
+        articles = articles.filter(row => {
+          const text = `${row.Title || ''} ${row.ArticleText || ''}`.toLowerCase()
+          return keywordList.some(kw => text.includes(kw))
+        })
+      }
+
+      if (articles.length === 0) {
+        if (req.file) fs.unlinkSync(req.file.path)
+        return res.status(400).json({ message: 'No articles found matching your keywords' })
+      }
     }
 
-    children.push(
-      new Paragraph({
-        alignment: AlignmentType.CENTER,
-        spacing: { after: 400 },
+    // Parse keyword list for highlighting
+    const keywordList = keywords
+      ? keywords.split(',').map(k => k.trim().toLowerCase()).filter(k => k)
+      : []
+
+    // ── Build document children ──────────────────────────────
+    const children = []
+
+    // ── COVER PAGE ───────────────────────────────────────────
+    const coverAlign =
+      cover.alignment === 'Left' ? AlignmentType.LEFT :
+      cover.alignment === 'Right' ? AlignmentType.RIGHT :
+      AlignmentType.CENTER
+
+    children.push(new Paragraph({ children: [], spacing: { before: 2000 } }))
+
+    children.push(new Paragraph({
+      alignment: coverAlign,
+      spacing: { before: 400, after: 300 },
+      children: [
+        new TextRun({
+          text: title,
+          bold: cover.bold !== false,
+          size: (cover.titleSize || 48) * 2,
+          color: toDocxColor(cover.titleColor),
+          font: cover.fontFamily || 'Arial',
+        })
+      ]
+    }))
+
+    if (subtitle) {
+      children.push(new Paragraph({
+        alignment: coverAlign,
+        spacing: { after: 300 },
         children: [
           new TextRun({
-            text: new Date(reportDate || Date.now()).toLocaleDateString('en-US', { month: 'long', day: '2-digit', year: 'numeric' }),
-            size: 24,
-            color: (coverPage.dateColor || '94a3b8').replace('#', ''),
+            text: subtitle,
+            italics: true,
+            size: (cover.subtitleSize || 24) * 2,
+            color: toDocxColor(cover.subtitleColor),
+            font: cover.fontFamily || 'Arial',
           })
         ]
-      })
-    )
+      }))
+    }
+
+    // Date
+    const dateStr = (() => {
+      const now = new Date(reportDate || Date.now())
+      const fmt = cover.dateFormat || 'MMM DD, YYYY'
+      if (fmt === 'DD/MM/YYYY') {
+        return `${String(now.getDate()).padStart(2,'0')}/${String(now.getMonth()+1).padStart(2,'0')}/${now.getFullYear()}`
+      }
+      if (fmt === 'YYYY-MM-DD') {
+        return `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`
+      }
+      return now.toLocaleDateString('en-US', { month: 'long', day: '2-digit', year: 'numeric' })
+    })()
+
+    children.push(new Paragraph({
+      alignment: coverAlign,
+      children: [
+        new TextRun({
+          text: dateStr,
+          size: 24,
+          color: toDocxColor(cover.dateColor) || '94a3b8',
+          font: cover.fontFamily || 'Arial',
+        })
+      ]
+    }))
 
     // Page break after cover
     children.push(new Paragraph({ children: [new PageBreak()] }))
 
-    // ── TABLE OF CONTENTS ──────────────────────────────
-    children.push(
-      new Paragraph({
-        text: 'Table of Contents',
+    // ── TABLE OF CONTENTS ────────────────────────────────────
+    if (articles.length > 0) {
+      children.push(new Paragraph({
         heading: HeadingLevel.HEADING_1,
-        spacing: { before: 400, after: 400 },
-      })
-    )
+        spacing: { before: 400, after: 300 },
+        children: [new TextRun({ text: 'Table of Contents', bold: true, size: 36 })]
+      }))
 
-    // Build TOC entries manually
-    articles.forEach((article, index) => {
-      children.push(
-        new Paragraph({
+      articles.forEach((a, i) => {
+        children.push(new Paragraph({
           spacing: { after: 120 },
           children: [
             new TextRun({
-              text: `${index + 1}. ${article.Title || 'Untitled'}`,
-              size: 24,
+              text: `${i + 1}.  ${a.Title || 'Untitled'}`,
+              size: 22,
               font: 'Arial',
             })
           ]
-        })
-      )
-    })
+        }))
+      })
 
-    // Page break after TOC
-    children.push(new Paragraph({ children: [new PageBreak()] }))
+      children.push(new Paragraph({ children: [new PageBreak()] }))
+    }
 
-    // ── ARTICLES ─────────────────────────────────────────
-    for (const article of articles) {
+    // ── ARTICLES ─────────────────────────────────────────────
+    for (const a of articles) {
+
       // Article title
-      children.push(
-        new Paragraph({
-          spacing: { before: 400, after: 200 },
-          children: [
-            new TextRun({
-              text: article.Title || 'Untitled',
-              bold: articlePage.titleBold !== false,
-              size: Math.min((articlePage.titleSize || 32) * 2, 64),
-              color: (articlePage.titleColor || '#0f172a').replace('#', ''),
-              font: articlePage.titleFontFamily || 'Arial',
-            })
-          ]
-        })
-      )
+      children.push(new Paragraph({
+        spacing: { before: 300, after: 200 },
+        children: [
+          new TextRun({
+            text: a.Title || 'Untitled',
+            bold: article.titleBold !== false,
+            italics: article.titleItalic || false,
+            size: (article.titleSize || 28) * 2,
+            color: toDocxColor(article.titleColor),
+            font: article.titleFontFamily || 'Arial',
+          })
+        ]
+      }))
 
-      // Source + Author + Date metadata
-      children.push(
-        new Paragraph({
+      // Source + metadata
+      const meta = [
+        a.SiteName && `Source: ${a.SiteName}`,
+        a.Author && `Author: ${a.Author}`,
+        a.Date && `Date: ${a.Date}`,
+      ].filter(Boolean).join('  |  ')
+
+      if (meta) {
+        children.push(new Paragraph({
           spacing: { after: 200 },
           children: [
             new TextRun({
-              text: `Source: ${article.SiteName || 'Unknown'} | Author: ${article.Author || 'Unknown'} | Date: ${article.Date || ''}`,
-              size: 20,
-              color: (articlePage.sourceColor || '64748b').replace('#', ''),
-              font: articlePage.sourceFontFamily || 'Arial',
-              italics: articlePage.sourceItalic || false,
+              text: meta,
+              size: (article.sourceSize || 12) * 2,
+              color: toDocxColor(article.sourceColor) || '64748b',
+              font: article.sourceFontFamily || 'Arial',
+              bold: article.sourceBold || false,
+              italics: article.sourceItalic || false,
             })
           ]
-        })
-      )
+        }))
+      }
 
-      // Article image
-      if (article.Image) {
-        const imageBuffer = await downloadImage(article.Image)
+      // Image (top position)
+      if (a.Image && article.imagePosition !== 'Bottom') {
+        const imageBuffer = await downloadImage(a.Image)
         if (imageBuffer) {
           try {
             const dims = getImageDimensions(imageBuffer)
-            children.push(
-              new Paragraph({
-                spacing: { after: 200 },
-                children: [
-                  new ImageRun({
-                    data: imageBuffer,
-                    transformation: {
-                      width: dims.width,
-                      height: dims.height,
-                    }
-                  })
-                ]
-              })
-            )
+            // Apply image size percentage
+            const sizeRatio = (article.imageSize || 100) / 100
+            children.push(new Paragraph({
+              spacing: { after: 200 },
+              children: [
+                new ImageRun({
+                  data: imageBuffer,
+                  transformation: {
+                    width: Math.round(dims.width * sizeRatio),
+                    height: Math.round(dims.height * sizeRatio),
+                  }
+                })
+              ]
+            }))
           } catch {
-            // Skip image if it fails
+            // Skip image silently
           }
         }
       }
 
-      // Article body text with keyword highlighting
-      if (article.ArticleText) {
-        const paragraphs = article.ArticleText.split('\n').filter(p => p.trim())
-        const keywordList = keywords
-          ? keywords.split(',').map(k => k.trim().toLowerCase()).filter(k => k)
-          : []
+      // Article body with keyword highlighting
+      if (a.ArticleText) {
+        const paragraphs = a.ArticleText
+          .split('\n')
+          .map(p => p.trim())
+          .filter(p => p.length > 0)
 
-        for (const para of paragraphs.slice(0, 10)) {
-          const trimmed = para.trim()
+        const bodyStyle = {
+          size: (article.bodySize || 11) * 2,
+          color: toDocxColor(article.bodyColor) || '374151',
+          font: article.bodyFontFamily || 'Arial',
+          bold: article.bodyBold || false,
+          italics: article.bodyItalic || false,
+        }
 
-          if (keywordList.length === 0) {
-            // No keywords — render plain text
-            children.push(
-              new Paragraph({
-                spacing: { after: 160 },
-                children: [
-                  new TextRun({
-                    text: trimmed,
-                    size: (articlePage.bodySize || 14) * 2,
-                    color: (articlePage.bodyColor || '374151').replace('#', ''),
-                    font: articlePage.bodyFontFamily || 'Arial',
-                  })
-                ]
-              })
-            )
-          } else {
-            /*
-              Split the paragraph into segments — highlighted and normal.
-              We find keyword positions and split around them.
-            */
-            const runs = []
-            let remaining = trimmed
-            let lastIndex = 0
+        for (const para of paragraphs) {
+          const runs = buildTextRuns(para, keywordList, bodyStyle)
+          children.push(new Paragraph({
+            spacing: { after: 160, line: Math.round((article.bodyLineHeight || 1.5) * 240) },
+            children: runs
+          }))
+        }
+      }
 
-            // Build a regex that matches any of the keywords
-            const regex = new RegExp(`(${keywordList.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'gi')
-            const parts = trimmed.split(regex)
-
-            for (const part of parts) {
-              const isKeyword = keywordList.includes(part.toLowerCase())
-              runs.push(
-                new TextRun({
-                  text: part,
-                  size: (articlePage.bodySize || 14) * 2,
-                  color: (articlePage.bodyColor || '374151').replace('#', ''),
-                  font: articlePage.bodyFontFamily || 'Arial',
-                  // Yellow highlight for matching keywords
-                  highlight: isKeyword ? 'yellow' : undefined,
-                  bold: isKeyword ? true : (articlePage.bodyBold || false),
+      // Image (bottom position)
+      if (a.Image && article.imagePosition === 'Bottom') {
+        const imageBuffer = await downloadImage(a.Image)
+        if (imageBuffer) {
+          try {
+            const dims = getImageDimensions(imageBuffer)
+            const sizeRatio = (article.imageSize || 100) / 100
+            children.push(new Paragraph({
+              spacing: { before: 200 },
+              children: [
+                new ImageRun({
+                  data: imageBuffer,
+                  transformation: {
+                    width: Math.round(dims.width * sizeRatio),
+                    height: Math.round(dims.height * sizeRatio),
+                  }
                 })
-              )
-            }
-
-            children.push(
-              new Paragraph({
-                spacing: { after: 160 },
-                children: runs
-              })
-            )
+              ]
+            }))
+          } catch {
+            // Skip image silently
           }
         }
       }
@@ -317,7 +363,7 @@ const generateReport = async (req, res) => {
       children.push(new Paragraph({ children: [new PageBreak()] }))
     }
 
-    // ── GENERATE WORD DOCUMENT ────────────────────────────
+    // ── GENERATE WORD DOCUMENT ───────────────────────────────
     const doc = new Document({
       sections: [{
         properties: {},
@@ -327,31 +373,43 @@ const generateReport = async (req, res) => {
 
     const buffer = await Packer.toBuffer(doc)
 
-    // Save report to database
-    const reportResult = await pool.query(
-      `INSERT INTO reports (name, template_id, created_by, keywords, links_count, format, report_shape, report_date, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'success') RETURNING id`,
-      [title || 'Report', templateId || null, req.user.userId, keywords || '', articles.length, format || 'word', reportShape || 'combined', reportDate || new Date()]
+    // ── SAVE TO DATABASE ─────────────────────────────────────
+    await pool.query(
+      `INSERT INTO reports
+        (name, template_id, created_by, keywords, links_count, format, report_shape, report_date, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'success')`,
+      [
+        title,
+        templateId || null,
+        req.user.userId,
+        keywords || '',
+        articles.length,
+        format || 'word',
+        reportShape || 'combined',
+        reportDate || new Date()
+      ]
     )
 
-    // Clean up uploaded Excel file
-    fs.unlinkSync(req.file.path)
+    // ── CLEAN UP UPLOADED FILE ───────────────────────────────
+    if (req.file && fs.existsSync(req.file.path)) {
+      fs.unlinkSync(req.file.path)
+    }
 
-    // Send the Word file back to the client
-    const fileName = `${(title || 'report').replace(/\s+/g, '_')}_${Date.now()}.docx`
+    // ── SEND FILE TO BROWSER ─────────────────────────────────
+    const fileName = `${title.replace(/\s+/g, '_')}_${Date.now()}.docx`
     res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`)
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
     res.send(buffer)
 
   } catch (error) {
     console.error('Generate report error:', error)
+    if (req.file && fs.existsSync(req.file.path)) {
+      fs.unlinkSync(req.file.path)
+    }
     res.status(500).json({ message: 'Failed to generate report: ' + error.message })
   }
 }
 
-/*
-  getReports: returns all reports for the history page.
-*/
 const getReports = async (req, res) => {
   try {
     const result = await pool.query(
@@ -368,14 +426,15 @@ const getReports = async (req, res) => {
   }
 }
 
-/*
-  deleteReport: deletes a report by id.
-*/
 const deleteReport = async (req, res) => {
   try {
     const { id } = req.params
-    const result = await pool.query('DELETE FROM reports WHERE id = $1 RETURNING id', [id])
-    if (result.rows.length === 0) return res.status(404).json({ message: 'Report not found' })
+    const result = await pool.query(
+      'DELETE FROM reports WHERE id = $1 RETURNING id', [id]
+    )
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Report not found' })
+    }
     res.json({ message: 'Report deleted successfully' })
   } catch (error) {
     console.error('Delete report error:', error)
