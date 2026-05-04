@@ -1,0 +1,10 @@
+const router = require('express').Router()
+const auth = require('../middleware/authMiddleware')
+const perm = require('../middleware/permissionMiddleware')
+const { getRoles, createRole, deleteRole, getRolePermissions, saveRolePermissions } = require('../controllers/rolesController')
+router.get('/', auth, perm('View Roles'), getRoles)
+router.post('/', auth, perm('Create Role'), createRole)
+router.delete('/:id', auth, perm('Delete Role'), deleteRole)
+router.get('/:id/permissions', auth, getRolePermissions)
+router.put('/:id/permissions', auth, perm('Edit Role Permissions'), saveRolePermissions)
+module.exports = router

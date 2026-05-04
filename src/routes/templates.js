@@ -1,0 +1,10 @@
+const router = require('express').Router()
+const auth = require('../middleware/authMiddleware')
+const perm = require('../middleware/permissionMiddleware')
+const { getTemplates, getTemplate, createTemplate, updateTemplate, deleteTemplate } = require('../controllers/templatesController')
+router.get('/', auth, perm('View Templates'), getTemplates)
+router.get('/:id', auth, perm('View Templates'), getTemplate)
+router.post('/', auth, perm('Create Template'), createTemplate)
+router.put('/:id', auth, perm('Edit Template'), updateTemplate)
+router.delete('/:id', auth, perm('Delete Template'), deleteTemplate)
+module.exports = router
